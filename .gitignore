@@ -74,3 +74,4 @@ out/
 # Build output
 build/
 *.mc
+!tests/**/*.mc
