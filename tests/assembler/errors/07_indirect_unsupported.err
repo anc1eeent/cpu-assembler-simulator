@@ -1,0 +1,1 @@
+address 8: indirect addressing is only supported by lw, sw and jalr

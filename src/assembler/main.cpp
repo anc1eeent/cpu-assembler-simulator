@@ -1,4 +1,13 @@
-// Two-pass assembler for the base SK (32-bit) instruction set.
+// Two-pass assembler for the modified SK computer (variant 20).
+//
+// Usage: assemble <input.as> <output.mc>
+//
+// Pass 1 assigns an address to every label, pass 2 encodes every line
+// into a 56-bit machine word. The output file contains one decimal number
+// per line and is written only if the whole program assembled without errors.
+// Exit code: 0 on success, 1 on any error.
+
+#include <algorithm>
 #include <cctype>
 #include <cstdint>
 #include <fstream>
@@ -9,9 +18,10 @@
 #include <unordered_map>
 #include <vector>
 
-constexpr int NUM_REGS = 8;
-constexpr int OFFSET_MIN = -32768;  // 16-bit signed offset
-constexpr int OFFSET_MAX = 32767;
+#include "../common/isa.h"
+
+using isa::Format;
+using isa::Opcode;
 
 // One line of an assembly program split into fields
 struct Line {
@@ -20,19 +30,12 @@ struct Line {
     std::string arg0, arg1, arg2;
 };
 
-// Any error in the source program; reported with the line address
+// Any error in the source program
 struct AsmError : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
-using LabelTable = std::unordered_map<std::string, int>;
-
-enum Opcode { ADD = 0, NAND, LW, SW, BEQ, JALR, HALT, NOOP };
-
-const std::unordered_map<std::string, Opcode> OPCODES = {
-    {"add", ADD}, {"nand", NAND}, {"lw", LW},     {"sw", SW},
-    {"beq", BEQ}, {"jalr", JALR}, {"halt", HALT}, {"noop", NOOP},
-};
+using LabelTable = std::unordered_map<std::string, int64_t>;
 
 // Splits a line into label, opcode and up to three fields.
 // Everything after the third field is a comment and is ignored.
@@ -50,6 +53,12 @@ Line parseLine(const std::string& text) {
     // the remaining fields simply stay empty
     ss >> line.opcode >> line.arg0 >> line.arg1 >> line.arg2;
     return line;
+}
+
+std::string toLower(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return s;
 }
 
 // Label rules: up to 6 characters, letters or digits, must start with a letter
@@ -72,22 +81,38 @@ bool isNumber(const std::string& s) {
     return true;
 }
 
+int64_t parseNumber(const std::string& s) {
+    try {
+        return std::stoll(s);
+    } catch (const std::out_of_range&) {
+        throw AsmError("number out of range: " + s);
+    }
+}
+
 // Register field: a number from 0 to NUM_REGS - 1
-int parseRegister(const std::string& s) {
+int64_t parseRegister(const std::string& s) {
     if (s.empty()) throw AsmError("missing register field");
     if (!isNumber(s)) throw AsmError("register must be a number: '" + s + "'");
-    int reg = std::stoi(s);
-    if (reg < 0 || reg >= NUM_REGS) throw AsmError("register out of range: " + s);
+    int64_t reg = parseNumber(s);
+    if (reg < 0 || reg >= isa::NUM_REGS) throw AsmError("register out of range: " + s);
     return reg;
 }
 
 // Field that holds either a number or a label; labels resolve to their address
-long long resolveValue(const std::string& s, const LabelTable& labels) {
+int64_t resolveValue(const std::string& s, const LabelTable& labels) {
     if (s.empty()) throw AsmError("missing field");
-    if (isNumber(s)) return std::stoll(s);
+    if (isNumber(s)) return parseNumber(s);
     auto it = labels.find(s);
     if (it == labels.end()) throw AsmError("undefined label '" + s + "'");
     return it->second;
+}
+
+const isa::OpcodeInfo* findOpcode(const std::string& name) {
+    std::string lower = toLower(name);
+    for (const auto& info : isa::OPCODE_TABLE) {
+        if (lower == info.name) return &info;
+    }
+    return nullptr;
 }
 
 // Pass 1: assigns an address to every label
@@ -96,60 +121,74 @@ LabelTable buildLabelTable(const std::vector<Line>& program) {
     for (size_t addr = 0; addr < program.size(); ++addr) {
         const std::string& label = program[addr].label;
         if (label.empty()) continue;
+        std::string where = "address " + std::to_string(addr) + ": ";
         if (!isValidLabel(label)) {
-            throw AsmError("address " + std::to_string(addr) + ": invalid label '" + label + "'");
+            throw AsmError(where + "invalid label '" + label + "'");
         }
         if (labels.count(label)) {
-            throw AsmError("address " + std::to_string(addr) + ": duplicate label '" + label + "'");
+            throw AsmError(where + "duplicate label '" + label + "'");
         }
-        labels[label] = static_cast<int>(addr);
+        labels[label] = static_cast<int64_t>(addr);
     }
     return labels;
 }
 
-// Pass 2: turns one line into a 32-bit machine word
-int32_t encode(const Line& line, int addr, const LabelTable& labels) {
+// Pass 2: turns one line into a 56-bit machine word
+int64_t encode(const Line& line, int64_t addr, const LabelTable& labels) {
     if (line.opcode == ".fill") {
-        return static_cast<int32_t>(resolveValue(line.arg0, labels));
+        int64_t value = resolveValue(line.arg0, labels);
+        if (value < isa::WORD_MIN || value > isa::WORD_MAX) {
+            throw AsmError(".fill value does not fit in 56 bits: " + line.arg0);
+        }
+        return value;
     }
 
-    auto it = OPCODES.find(line.opcode);
-    if (it == OPCODES.end()) throw AsmError("unknown opcode '" + line.opcode + "'");
-    Opcode op = it->second;
+    const isa::OpcodeInfo* info = findOpcode(line.opcode);
+    if (info == nullptr) throw AsmError("unknown opcode '" + line.opcode + "'");
+    Opcode op = info->code;
 
-    int32_t instr = op << 22;
-    switch (op) {
-    case ADD:
-    case NAND:  // R-type: regA regB destReg
-        instr |= parseRegister(line.arg0) << 19;
-        instr |= parseRegister(line.arg1) << 16;
+    // A leading '@' on regA selects register indirect addressing
+    std::string regA = line.arg0;
+    int64_t mode = 0;
+    if (!regA.empty() && regA[0] == '@') {
+        if (!isa::supportsIndirect(op)) {
+            throw AsmError("indirect addressing is only supported by lw, sw and jalr");
+        }
+        mode = 1;
+        regA = regA.substr(1);
+    }
+
+    int64_t instr = (mode << isa::MODE_SHIFT) | (int64_t{op} << isa::OPCODE_SHIFT);
+    switch (info->format) {
+    case Format::R:  // regA regB destReg
+        instr |= parseRegister(regA) << isa::REG_A_SHIFT;
+        instr |= parseRegister(line.arg1) << isa::REG_B_SHIFT;
         instr |= parseRegister(line.arg2);
         break;
 
-    case LW:
-    case SW:
-    case BEQ: {  // I-type: regA regB offset
-        instr |= parseRegister(line.arg0) << 19;
-        instr |= parseRegister(line.arg1) << 16;
-        long long offset = resolveValue(line.arg2, labels);
-        // beq jumps relative to the next instruction, so a label becomes a distance
-        if (op == BEQ && !isNumber(line.arg2)) {
+    case Format::I: {  // regA regB offset
+        instr |= parseRegister(regA) << isa::REG_A_SHIFT;
+        instr |= parseRegister(line.arg1) << isa::REG_B_SHIFT;
+        // In indirect mode the address comes from memory, the offset field stays 0
+        if (mode == 1) break;
+        int64_t offset = resolveValue(line.arg2, labels);
+        // Jumps are relative to the next instruction, so a label becomes a distance
+        if (isa::isBranch(op) && !isNumber(line.arg2)) {
             offset -= addr + 1;
         }
-        if (offset < OFFSET_MIN || offset > OFFSET_MAX) {
+        if (offset < isa::OFFSET_MIN || offset > isa::OFFSET_MAX) {
             throw AsmError("offset out of range: " + std::to_string(offset));
         }
-        instr |= static_cast<int32_t>(offset & 0xFFFF);
+        instr |= offset & isa::OFFSET_MASK;
         break;
     }
 
-    case JALR:  // J-type: regA regB
-        instr |= parseRegister(line.arg0) << 19;
-        instr |= parseRegister(line.arg1) << 16;
+    case Format::J:  // regA regB
+        instr |= parseRegister(regA) << isa::REG_A_SHIFT;
+        instr |= parseRegister(line.arg1) << isa::REG_B_SHIFT;
         break;
 
-    case HALT:
-    case NOOP:  // O-type: no fields
+    case Format::O:  // no fields
         break;
     }
     return instr;
@@ -175,12 +214,15 @@ int main(int argc, char* argv[]) {
         program.push_back(line);
     }
 
-    std::vector<int32_t> machineCode;
+    std::vector<int64_t> machineCode;
     try {
+        if (static_cast<int64_t>(program.size()) > isa::MEMORY_SIZE) {
+            throw AsmError("program does not fit in memory");
+        }
         LabelTable labels = buildLabelTable(program);
         for (size_t addr = 0; addr < program.size(); ++addr) {
             try {
-                machineCode.push_back(encode(program[addr], static_cast<int>(addr), labels));
+                machineCode.push_back(encode(program[addr], static_cast<int64_t>(addr), labels));
             } catch (const AsmError& e) {
                 throw AsmError("address " + std::to_string(addr) + ": " + e.what());
             }
@@ -190,14 +232,14 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // The output file is written only if the whole program assembled without errors
     std::ofstream out(argv[2]);
     if (!out) {
         std::cerr << "error: cannot open " << argv[2] << "\n";
         return 1;
     }
-    for (int32_t word : machineCode) {
+    for (int64_t word : machineCode) {
         out << word << "\n";
     }
+    std::cout << "assembled " << machineCode.size() << " words into " << argv[2] << "\n";
     return 0;
 }
